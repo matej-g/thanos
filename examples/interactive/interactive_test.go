@@ -8,15 +8,17 @@ import (
 	"os"
 	execlib "os/exec"
 	"path/filepath"
+	"strconv"
 	"testing"
+	"time"
 
 	"github.com/efficientgo/e2e"
 	e2edb "github.com/efficientgo/e2e/db"
 	e2einteractive "github.com/efficientgo/e2e/interactive"
-	e2emonitoring "github.com/efficientgo/e2e/monitoring"
 	"github.com/pkg/errors"
 	"github.com/thanos-io/thanos/pkg/objstore/client"
 	"github.com/thanos-io/thanos/pkg/objstore/s3"
+	"github.com/thanos-io/thanos/pkg/queryfrontend"
 	"github.com/thanos-io/thanos/pkg/testutil"
 	tracingclient "github.com/thanos-io/thanos/pkg/tracing/client"
 	"github.com/thanos-io/thanos/pkg/tracing/jaeger"
@@ -89,7 +91,7 @@ func createData() (perr error) {
 // TestReadOnlyThanosSetup runs read only Thanos setup that has data from `maxTimeFresh - 2w` to `maxTimeOld`, with extra monitoring and tracing for full playground experience.
 // Run with test args `-test.timeout 9999m`.
 func TestReadOnlyThanosSetup(t *testing.T) {
-	t.Skip("This is interactive test - it will until you will kill it or curl 'finish' endpoint. Comment and run as normal test to use it!")
+	// t.Skip("This is interactive test - it will until you will kill it or curl 'finish' endpoint. Comment and run as normal test to use it!")
 
 	// Create 20k series for 2w of TSDB blocks. Cache them to 'data' dir so we don't need to re-create on every run (it takes ~5m).
 	_, err := os.Stat(data)
@@ -103,8 +105,8 @@ func TestReadOnlyThanosSetup(t *testing.T) {
 	testutil.Ok(t, err)
 	t.Cleanup(e.Close)
 
-	m, err := e2emonitoring.Start(e)
-	testutil.Ok(t, err)
+	// m, err := e2emonitoring.Start(e)
+	// testutil.Ok(t, err)
 
 	// Initialize object storage with two buckets (our long term storage).
 	//
@@ -310,17 +312,71 @@ global:
 	)
 	testutil.Ok(t, e2e.StartAndWaitReady(query1))
 
+	inMemoryCacheConfig := queryfrontend.CacheProviderConfig{
+		Type: queryfrontend.INMEMORY,
+		Config: queryfrontend.InMemoryResponseCacheConfig{
+			MaxSizeItems: 1000,
+			Validity:     time.Hour,
+		},
+	}
+
+	feQuery1, err := newQueryFrontend(e, "fe-query", "http://"+query1.InternalEndpoint("http"), inMemoryCacheConfig)
+	testutil.Ok(t, err)
+	testutil.Ok(t, e2e.StartAndWaitReady(feQuery1))
+
 	// Let's start the party with 1.5 billions of samples (~20k series for 15s scrape for 2w).
 	// Wait until we have 5 gRPC connections.
 	testutil.Ok(t, query1.WaitSumMetricsWithOptions(e2e.Equals(5), []string{"thanos_store_nodes_grpc_connections"}, e2e.WaitMissingMetrics()))
 
 	const path = "graph?g0.expr=sum(continuous_app_metric99)%20by%20(cluster%2C%20replica)&g0.tab=0&g0.stacked=0&g0.range_input=2w&g0.max_source_resolution=0s&g0.deduplicate=0&g0.partial_response=0&g0.store_matches=%5B%5D&g0.end_input=2021-07-27%2000%3A00%3A00"
 	testutil.Ok(t, e2einteractive.OpenInBrowser(fmt.Sprintf("http://%s/%s", query1.Endpoint("http"), path)))
-	testutil.Ok(t, e2einteractive.OpenInBrowser(fmt.Sprintf("http://%s/%s", prom2.Endpoint("http"), path)))
+	// testutil.Ok(t, e2einteractive.OpenInBrowser(fmt.Sprintf("http://%s/%s", prom2.Endpoint("http"), path)))
+	testutil.Ok(t, e2einteractive.OpenInBrowser(fmt.Sprintf("http://%s/%s", feQuery1.Endpoint("http"), path)))
 
 	// Tracing endpoint.
 	testutil.Ok(t, e2einteractive.OpenInBrowser("http://"+j.Endpoint("http-front")))
 	// Monitoring Endpoint.
-	testutil.Ok(t, m.OpenUserInterfaceInBrowser())
+	// testutil.Ok(t, m.OpenUserInterfaceInBrowser())
 	testutil.Ok(t, e2einteractive.RunUntilEndpointHit())
+}
+
+func newQueryFrontend(e e2e.Environment, name, downstreamURL string, cacheConfig queryfrontend.CacheProviderConfig) (*e2e.InstrumentedRunnable, error) {
+	cacheConfigBytes, err := yaml.Marshal(cacheConfig)
+	if err != nil {
+		return nil, errors.Wrapf(err, "marshal response cache config file: %v", cacheConfig)
+	}
+
+	max := 100
+	tripperConfig := &queryfrontend.DownstreamTripperConfig{
+		MaxIdleConnsPerHost: &max,
+	}
+
+	tripperConfigBytes, err := yaml.Marshal(tripperConfig)
+	if err != nil {
+		return nil, errors.Wrapf(err, "marshal response cache config file: %v", tripperConfig)
+	}
+
+	args := e2e.BuildArgs(map[string]string{
+		"--debug.name":                               fmt.Sprintf("query-frontend-%s", name),
+		"--http-address":                             ":8080",
+		"--query-frontend.downstream-url":            downstreamURL,
+		"--log.level":                                "info",
+		"--query-range.response-cache-config":        string(cacheConfigBytes),
+		"--query-frontend.downstream-tripper-config": string(tripperConfigBytes),
+	})
+
+	queryFrontend := e2e.NewInstrumentedRunnable(
+		e,
+		fmt.Sprintf("query-frontend-%s", name),
+		map[string]int{"http": 8080},
+		"http").Init(
+		e2e.StartOptions{
+			Image:     "thanos",
+			Command:   e2e.NewCommand("query-frontend", args...),
+			Readiness: e2e.NewHTTPReadinessProbe("http", "/-/ready", 200, 200),
+			User:      strconv.Itoa(os.Getuid()),
+		},
+	)
+
+	return queryFrontend, nil
 }
